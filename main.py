@@ -288,7 +288,7 @@ def main():
     if len(sys.argv) > 1:
         fname = sys.argv[1]
     else:
-        fname = input(f'Enter creds file [combo.txt]: ').strip()
+        fname = ("combo.txt")
         if not fname:
             fname = 'combo.txt'
 
