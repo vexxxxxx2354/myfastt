@@ -298,33 +298,40 @@ def main():
 
     # --- Proxy Setup ---
     print('\n' + '=' * 70)
-    print('PROXY SETUP')
-    print('=' * 70)
-    rotator = None
-    ans = input('\nUse proxies? (Y/n): ').strip().lower()
-    if ans != 'n':
-        wp = load_cache()
+print('AUTOMATIC PROXY SETUP')
+print('=' * 70)
+
+rotator = None
+
+# 1. یەکەمجار هەوڵدەدات پرۆکسییەکان لە کاشەوە بخوێنێتەوە
+wp = load_cache()
+
+if wp:
+    print(f'[+] Cached {len(wp)} proxies ({CACHE_FILE})')
+    proxy_stats(wp)
+else:
+    print('[*] No cached proxies found. Starting fresh scrape...')
+
+# 2. ئەگەر کاشەکە بەتاڵ بوو، ڕاستەوخۆ خۆی سکڕەیپ دەکات بێ پرسیارکردن
+if not wp:
+    raw = scrape_all_proxies()
+    if raw:
+        print(f'[+] Scraped {len(raw)} raw proxies. Validating...')
+        wp = validate_proxies(raw, max_workers=100, max_valid=500)
         if wp:
-            print(f'[+] Cached {len(wp)} proxies ({CACHE_FILE})')
+            save_cache(wp)
             proxy_stats(wp)
-            if input('Reuse? (Y/n): ').strip().lower() == 'n':
-                wp = None
-        if not wp:
-            raw = scrape_all_proxies()
-            if raw:
-                wp = validate_proxies(raw, max_workers=100, max_valid=500)
-                if wp:
-                    save_cache(wp)
-                    proxy_stats(wp)
-                else:
-                    print('[!] No working proxies')
-            else:
-                print('[!] No proxies scraped')
-        if wp:
-            rotator = ProxyRotator(wp)
-            print(f'\n[+] Rotator: {rotator.count} proxies')
+        else:
+            print('[!] No working proxies found after validation')
     else:
-        print('[*] No proxies')
+        print('[!] No proxies scraped')
+
+# 3. ئەگەر پرۆکسی ئامادە بوو، ڕۆتەیتەرەکە کارپێدەکات
+if wp:
+    rotator = ProxyRotator(wp)
+    print(f'\n[+] Rotator active: {rotator.count} proxies ready.')
+else:
+    print('[*] Running without proxies (No valid proxies available)')
 
     # --- Check ---
     print('\n' + '=' * 70)
