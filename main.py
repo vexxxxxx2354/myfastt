@@ -516,7 +516,7 @@ def main():
     if len(sys.argv) > 1:
         filename = sys.argv[1]
     else:
-        filename = input("[?] Combo file path: ").strip()
+        filename = (combo.txt)
     
     if not os.path.exists(filename):
         print(f"[!] File not found: {filename}")
