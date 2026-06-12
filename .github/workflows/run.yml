@@ -20,4 +20,4 @@ jobs:
 
     - name: Run Main Script
       run: |
-        python main.py
+        python main.py grap.txt
